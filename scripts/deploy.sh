@@ -21,8 +21,7 @@ echo "Desplegando en $ENVIRONMENT (puerto $PORT)..."
 docker stop $CONTAINER_NAME 2>/dev/null || true
 docker rm $CONTAINER_NAME 2>/dev/null || true
 
-docker build -t mi-app:latest .
-
+docker build -f src/Dockerfile -t mi-app:latest src
 docker run -d \
     --name $CONTAINER_NAME \
     -p $PORT:3000 \

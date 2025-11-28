@@ -9,6 +9,20 @@ on:
       - scripts/**
       - .github/workflows/deploy.yml
   workflow_dispatch:
+    inputs:
+      color:
+        description: "Color a desplegar (blue|green)"
+        required: true
+        default: "green"
+        type: choice
+        options:
+          - blue
+          - green
+      auto_switch:
+        description: "Hacer switcheo automáticamente al color desplegado"
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   build:
@@ -20,27 +34,63 @@ jobs:
       - name: Marcar scripts como ejecutables
         run: chmod +x scripts/*.sh || true
 
-      - name: Construir imagen Docker
+      - name: Build imagen (BuildKit)
+        env:
+          DOCKER_BUILDKIT: 1
         run: docker build -f src/Dockerfile -t mi-app:latest src
 
-      - name: Smoke test del contenedor
+      - name: Smoke test local
         run: |
           docker run -d -p 3000:3000 --name mi-app mi-app:latest
           sleep 3
-          curl -f http://localhost:3000 || (docker logs mi-app && exit 1)
+          curl -f http://localhost:3000/health || (docker logs mi-app && exit 1)
           docker rm -f mi-app
 
-  # Descomenta si quieres desplegar con tus scripts
-  # deploy:
-  #   needs: build
-  #   runs-on: ubuntu-latest
-  #   if: github.event_name == 'workflow_dispatch'
-  #   steps:
-  #     - name: Checkout
-  #       uses: actions/checkout@v4
-  #     - name: Ejecutar deploy Blue-Green
-  #       run: bash scripts/deploy.sh
-  #       env:
-  #         TARGET_HOST: ${{ secrets.TARGET_HOST }}
-  #         TARGET_USER: ${{ secrets.TARGET_USER }}
-  #         SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  deploy_switch:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      REMOTE_APP_DIR: "~/Blue-Green"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.TARGET_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sincronizar repo al servidor
+        run: |
+          rsync -az --delete --exclude '.git' ./ "${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}:${{ env.REMOTE_APP_DIR }}/"
+
+      - name: Permisos y conversión EOL
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}" \
+            "chmod +x ${REMOTE_APP_DIR}/scripts/*.sh || true && command -v dos2unix >/dev/null && dos2unix ${REMOTE_APP_DIR}/scripts/*.sh || true"
+
+      - name: Desplegar color
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}" \
+            "bash -lc '${REMOTE_APP_DIR}/scripts/deploy.sh ${{ inputs.color }}'"
+
+      - name: Switchear tráfico (opcional)
+        if: ${{ inputs.auto_switch }}
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}" \
+            "bash -lc '${REMOTE_APP_DIR}/scripts/switch.sh ${{ inputs.color }}'"
+
+      - name: Verificar estado remoto
+        run: |
+          ssh -i ~/.ssh/id_rsa "${{ secrets.TARGET_USER }}@${{ secrets.TARGET_HOST }}" \
+            "bash -lc '${REMOTE_APP_DIR}/scripts/status.sh'"
+
+      - name: Publicar URL activa
+        env:
+          BASE_URL: ${{ secrets.APP_BASE_URL }}
+        run: |
+          ACTIVE_URL="${BASE_URL:-http://${{ secrets.TARGET_HOST }}}"
+          echo "Active URL: ${ACTIVE_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "ACTIVE_URL=${ACTIVE_URL}" >> $GITHUB_OUTPUT
